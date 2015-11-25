@@ -1,10 +1,16 @@
+"""
+Provides unified interface for all Architect commands. Each command should live
+in a separate module and define an "arguments" variable which should contain the
+command's arguments and a "run" function which implements the command's behaviour.
+"""
+
 import os
 import sys
 import pkgutil
 import argparse
 
-from architect import __version__
-from architect.exceptions import (
+from .. import __version__, orms
+from ..exceptions import (
     BaseArchitectError,
     CommandNotProvidedError,
     CommandError,
@@ -13,17 +19,27 @@ from architect.exceptions import (
 
 commands = {}
 
-for _, name, _ in pkgutil.iter_modules([os.path.dirname(__file__)]):
-    commands[name] = {'module': __import__('architect.commands.{0}'.format(name), fromlist=['architect.commands'])}
+for _, name, __ in pkgutil.iter_modules([os.path.dirname(__file__)]):
+    commands[name] = {'module': __import__(name, globals(), level=1)}
+
+sys.path.append(os.getcwd())
 
 
 class ArgumentParser(argparse.ArgumentParser):
     def result(self, message):
-        """Prints command execution result in a common format"""
+        """
+        Prints command execution result in a common format.
+
+        :param string message: (required). Message to print.
+        """
         self._print_message('{0}: result: {1}\n'.format(self.prog, str(message)), sys.stdout)
 
     def error(self, message):
-        """Redefines some of argparse's error messages to be more friendly"""
+        """
+        Redefines some of argparse's error messages to be more friendly.
+
+        :param string message: (required). Error message to print.
+        """
         commands_list = commands.keys()
 
         if 'too few arguments' in message:
@@ -44,7 +60,9 @@ class ArgumentParser(argparse.ArgumentParser):
 
 
 def main():
-    """Initialization function for all commands"""
+    """
+    Initialization function for all commands.
+    """
     parser = ArgumentParser(prog='architect')
     parser.add_argument('-v', '--version', action='version', version='Architect {0}'.format(__version__))
 
@@ -53,8 +71,7 @@ def main():
     for command in commands:
         commands[command]['parser'] = subparsers.add_parser(
             command,
-            formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=50, width=100)
-        )
+            formatter_class=lambda prog: argparse.HelpFormatter(prog, max_help_position=50, width=100))
 
         for argument in commands[command]['module'].arguments:
             for names, options in argument.items():
@@ -70,8 +87,9 @@ def main():
         command = args.func.__module__.split('.')[-1]
     except AttributeError:
         parser.error('too few arguments')
-
-    try:
-        commands[command]['parser'].result(args.func(vars(args)))
-    except BaseArchitectError as e:
-        commands[command]['parser'].error(str(e))
+    else:
+        orms.init()
+        try:
+            commands[command]['parser'].result(args.func(vars(args)))
+        except BaseArchitectError as e:
+            commands[command]['parser'].error(str(e))

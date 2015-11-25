@@ -6,22 +6,61 @@ partitioning, one can safely work with it via raw SQL statements without
 using any kind of the ORM or anything else.
 """
 
-from architect.databases import BasePartition
-from architect.exceptions import (
+from ..bases import BasePartition
+from ...exceptions import (
     PartitionRangeSubtypeError,
-    PartitionRangeError
+    PartitionConstraintError
 )
 
 
 class Partition(BasePartition):
-    """Common methods for all partition types"""
     def prepare(self):
-        """Prepares needed triggers and functions for those triggers"""
+        """
+        Prepares needed triggers and functions for those triggers.
+        """
+        indentation = {'declarations': 5, 'variables': 6}
+        definitions, formatters = self._get_definitions()
+
+        for definition in indentation:
+            for index, _ in enumerate(definitions.setdefault(definition, [])):
+                if index > 0:
+                    definitions[definition][index] = '    ' * indentation[definition] + definitions[definition][index]
+
+            definitions[definition] = '\n'.join(definitions[definition]).format(**formatters)
+
         return self.database.execute("""
             -- We need to create a before insert function
-            CREATE OR REPLACE FUNCTION {parent_table}_insert_child()
+            CREATE OR REPLACE FUNCTION {{parent_table}}_insert_child()
             RETURNS TRIGGER AS $$
-                {partition_function}
+                DECLARE
+                    match {{parent_table}}.{{column}}%TYPE;
+                    tablename VARCHAR;
+                    checks TEXT;
+                    {declarations}
+                BEGIN
+                    IF NEW.{{column}} IS NULL THEN
+                        tablename := '{{parent_table}}_null';
+                        checks := '{{column}} IS NULL';
+                    ELSE
+                        {variables}
+                    END IF;
+
+                    IF NOT EXISTS(
+                        SELECT 1 FROM information_schema.tables WHERE table_name=tablename)
+                    THEN
+                        BEGIN
+                            EXECUTE 'CREATE TABLE ' || tablename || ' (
+                                CHECK (' || checks || '),
+                                LIKE "{{parent_table}}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
+                            ) INHERITS ("{{parent_table}}");';
+                        EXCEPTION WHEN duplicate_table THEN
+                            -- pass
+                        END;
+                    END IF;
+
+                    EXECUTE 'INSERT INTO ' || tablename || ' VALUES (($1).*);' USING NEW;
+                    RETURN NEW;
+                END;
             $$ LANGUAGE plpgsql;
 
             -- Then we create a trigger which calls the before insert function
@@ -30,20 +69,20 @@ class Partition(BasePartition):
             IF NOT EXISTS(
                 SELECT 1
                 FROM information_schema.triggers
-                WHERE event_object_table = '{parent_table}'
-                AND trigger_name = 'before_insert_{parent_table}_trigger'
+                WHERE event_object_table = '{{parent_table}}'
+                AND trigger_name = 'before_insert_{{parent_table}}_trigger'
             ) THEN
-                CREATE TRIGGER before_insert_{parent_table}_trigger
-                    BEFORE INSERT ON "{parent_table}"
-                    FOR EACH ROW EXECUTE PROCEDURE {parent_table}_insert_child();
+                CREATE TRIGGER before_insert_{{parent_table}}_trigger
+                    BEFORE INSERT ON "{{parent_table}}"
+                    FOR EACH ROW EXECUTE PROCEDURE {{parent_table}}_insert_child();
             END IF;
             END $$;
 
             -- Then we create a function to delete duplicate row from the master table after insert
-            CREATE OR REPLACE FUNCTION {parent_table}_delete_master()
+            CREATE OR REPLACE FUNCTION {{parent_table}}_delete_master()
             RETURNS TRIGGER AS $$
                 BEGIN
-                    DELETE FROM ONLY "{parent_table}" WHERE {pk};
+                    DELETE FROM ONLY "{{parent_table}}" WHERE {{pk}};
                     RETURN NEW;
                 END;
             $$ LANGUAGE plpgsql;
@@ -54,52 +93,69 @@ class Partition(BasePartition):
             IF NOT EXISTS(
                 SELECT 1
                 FROM information_schema.triggers
-                WHERE event_object_table = '{parent_table}'
-                AND trigger_name = 'after_insert_{parent_table}_trigger'
+                WHERE event_object_table = '{{parent_table}}'
+                AND trigger_name = 'after_insert_{{parent_table}}_trigger'
             ) THEN
-                CREATE TRIGGER after_insert_{parent_table}_trigger
-                    AFTER INSERT ON "{parent_table}"
-                    FOR EACH ROW EXECUTE PROCEDURE {parent_table}_delete_master();
+                CREATE TRIGGER after_insert_{{parent_table}}_trigger
+                    AFTER INSERT ON "{{parent_table}}"
+                    FOR EACH ROW EXECUTE PROCEDURE {{parent_table}}_delete_master();
             END IF;
             END $$;
-        """.format(
+        """.format(**definitions).format(
             pk=' AND '.join('{pk} = NEW.{pk}'.format(pk=pk) for pk in self.pks),
             parent_table=self.table,
-            partition_function=self._get_partition_function()
+            column=self.column_name
         ))
 
     def exists(self):
-        """Checks if partition exists. Not used in this backend because everything is done at the database level"""
-        return True
+        """
+        Checks if partition exists. Not used in this backend because everything is done at the database level.
+        """
+        return False
 
     def create(self):
-        """Creates new partition. Not used in this backend because everything is done at the database level"""
+        """
+        Creates new partition. Not used in this backend because everything is done at the database level.
+        """
         pass
+
+    def _get_definitions(self):
+        """
+        Returns needed definitions for chosen partition type/subtype.
+        """
+        raise NotImplementedError('Method "_get_definitions" not implemented in: {0}'.format(self.__class__.__name__))
 
 
 class RangePartition(Partition):
-    """Range partition type implementation"""
-    def __init__(self, **kwargs):
-        super(RangePartition, self).__init__(**kwargs)
-        self.partition_range = kwargs['partition_range']
-        self.partition_subtype = kwargs['partition_subtype']
+    """
+    Range partition type implementation.
+    """
+    def __init__(self, model, **meta):
+        super(RangePartition, self).__init__(model, **meta)
+        self.constraint = meta['constraint']
+        self.subtype = meta['subtype']
 
-    def _get_partition_function(self):
-        """Dynamically loads needed before insert function body depending on the partition subtype"""
+    def _get_definitions(self):
+        """
+        Dynamically returns needed definitions depending on the partition subtype.
+        """
         try:
-            return getattr(self, '_get_{0}_partition_function'.format(self.partition_subtype))()
+            definitions = getattr(self, '_get_{0}_definitions'.format(self.subtype))()
+            formatters = dict(constraint=self.constraint, subtype=self.subtype, **definitions.pop('formatters', {}))
+            return definitions, formatters
         except AttributeError:
             import re
+            expression = '_get_(\w+)_function'
             raise PartitionRangeSubtypeError(
-                model=self.model,
+                model=self.model.__name__,
                 dialect=self.dialect,
-                current=self.partition_subtype,
-                allowed=[re.match('_get_(\w+)_partition_function', c).group(1) for c in dir(
-                    self) if re.match('_get_\w+_partition_function', c) is not None]
-            )
+                current=self.subtype,
+                allowed=[re.match(expression, c).group(1) for c in dir(self) if re.match(expression, c) is not None])
 
-    def _get_date_partition_function(self):
-        """Contains a before insert function body for date partition subtype"""
+    def _get_date_definitions(self):
+        """
+        Returns definitions for date partition subtype.
+        """
         patterns = {
             'day': '"y"YYYY"d"DDD',
             'week': '"y"IYYY"w"IW',
@@ -108,49 +164,86 @@ class RangePartition(Partition):
         }
 
         try:
-            partition_pattern = patterns[self.partition_range]
+            pattern = patterns[self.constraint]
         except KeyError:
-            raise PartitionRangeError(
-                model=self.model,
+            raise PartitionConstraintError(
+                model=self.model.__name__,
                 dialect=self.dialect,
-                current=self.partition_range,
-                allowed=patterns.keys()
-            )
+                current=self.constraint,
+                allowed=patterns.keys())
 
-        return """
-            DECLARE tablename TEXT;
-            DECLARE columntype TEXT;
-            DECLARE startdate TIMESTAMP;
-            BEGIN
-                startdate := date_trunc('{partition_range}', NEW.{partition_column});
-                tablename := '{parent_table}_' || to_char(NEW.{partition_column}, '{partition_pattern}');
+        return {
+            'formatters': {'pattern': pattern},
+            'variables': [
+                "match := DATE_TRUNC('{constraint}', NEW.{{column}});",
+                "tablename := '{{parent_table}}_' || TO_CHAR(NEW.{{column}}, '{pattern}');",
+                "checks := '{{column}} >= ''' || match || ''' AND {{column}} < ''' || (match + INTERVAL '1 {constraint}') || '''';"
+            ]
+        }
 
-                IF NOT EXISTS(
-                    SELECT 1 FROM information_schema.tables WHERE table_name=tablename)
-                THEN
-                    BEGIN
-                        SELECT data_type INTO columntype
-                        FROM information_schema.columns
-                        WHERE table_name = '{parent_table}' AND column_name = '{partition_column}';
+    def _get_integer_definitions(self):
+        """
+        Returns definitions for integer partition subtype.
+        """
+        if not self.constraint.isdigit() or int(self.constraint) < 1:
+            raise PartitionConstraintError(
+                model=self.model.__name__,
+                dialect=self.dialect,
+                current=self.constraint,
+                allowed=['positive integer'])
 
-                        EXECUTE 'CREATE TABLE ' || tablename || ' (
-                            CHECK (
-                                {partition_column} >= ''' || startdate || '''::' || columntype || ' AND
-                                {partition_column} < ''' || (startdate + '1 {partition_range}'::interval) || '''::' || columntype || '
-                            ),
-                            LIKE "{parent_table}" INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES
-                        ) INHERITS ("{parent_table}");';
-                    EXCEPTION WHEN duplicate_table THEN
-                        -- pass
-                    END;
-                END IF;
+        return {
+            'variables': [
+                "IF NEW.{{column}} = 0 THEN",
+                "    tablename := '{{parent_table}}_0';",
+                "    checks := '{{column}} = 0';",
+                "ELSE",
+                "    IF NEW.{{column}} > 0 THEN",
+                "        match := ((NEW.{{column}} - 1) / {constraint}) * {constraint} + 1;",
+                "        tablename := '{{parent_table}}_' || match || '_' || (match + {constraint}) - 1;",
+                "    ELSE",
+                "        match := FLOOR(NEW.{{column}} :: FLOAT / {constraint} :: FLOAT) * {constraint};",
+                "        tablename := '{{parent_table}}_m' || ABS(match) || '_m' || ABS((match + {constraint}) - 1);",
+                "    END IF;",
+                "    checks := '{{column}} >= ' || match || ' AND {{column}} <= ' || (match + {constraint}) - 1;",
+                "END IF;"
+            ]
+        }
 
-                EXECUTE 'INSERT INTO ' || tablename || ' VALUES (($1).*);' USING NEW;
-                RETURN NEW;
-            END;
-        """.format(
-            parent_table=self.table,
-            partition_range=self.partition_range,
-            partition_column=self.column_name,
-            partition_pattern=partition_pattern,
-        )
+    def _get_string_firstchars_definitions(self):
+        """
+        Returns definitions for string firstchars partition subtype.
+        """
+        if not self.constraint.isdigit() or int(self.constraint) < 1:
+            raise PartitionConstraintError(
+                model=self.model.__name__,
+                dialect=self.dialect,
+                current=self.constraint,
+                allowed=['positive integer'])
+
+        return {
+            'variables': [
+                "match := LOWER(SUBSTR(NEW.{{column}}, 1, {constraint}));",
+                "tablename := QUOTE_IDENT('{{parent_table}}_' || match);",
+                "checks := 'LOWER(SUBSTR({{column}}, 1, {constraint})) = ''' || match || '''';"
+            ]
+        }
+
+    def _get_string_lastchars_definitions(self):
+        """
+        Returns definitions for string lastchars partition subtype.
+        """
+        if not self.constraint.isdigit() or int(self.constraint) < 1:
+            raise PartitionConstraintError(
+                model=self.model.__name__,
+                dialect=self.dialect,
+                current=self.constraint,
+                allowed=['positive integer'])
+
+        return {
+            'variables': [
+                "match := LOWER(SUBSTRING(NEW.{{column}} FROM '.{{{{{constraint}}}}}$'));",
+                "tablename := QUOTE_IDENT('{{parent_table}}_' || match);",
+                "checks := 'LOWER(SUBSTRING({{column}} FROM ''.{{{{{constraint}}}}}$'')) = ''' || match || '''';"
+            ]
+        }
